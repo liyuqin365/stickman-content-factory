@@ -1,4 +1,8 @@
 __pycache__/
 *.pyc
+.venv/
+.video_deps/
 .DS_Store
 Thumbs.db
+outputs/videos/
+outputs/video_frames/
