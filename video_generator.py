@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,7 +28,7 @@ except ModuleNotFoundError as exc:
         "python -m pip install --target .video_deps imageio imageio-ffmpeg"
     ) from exc
 
-from content_factory import generate_script, generate_titles, sanitize_filename
+from content_factory import DEFAULT_TOPICS, generate_script, generate_titles, read_topics_file, sanitize_filename
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,14 @@ class VideoSegment:
     shot: int
     label: str
     voiceover: str
+    duration: float
+
+
+@dataclass(frozen=True)
+class CaptionCue:
+    shot: int
+    label: str
+    text: str
     duration: float
 
 
@@ -127,6 +136,82 @@ def parse_script_segments(theme: str, total_seconds: float) -> list[VideoSegment
         VideoSegment(shot=index, label=label, voiceover=voiceover, duration=scaled[index - 1])
         for index, (_, label, voiceover) in enumerate(raw_segments, start=1)
     ]
+
+
+def build_caption_cues(theme: str, total_seconds: float) -> list[CaptionCue]:
+    cues: list[CaptionCue] = []
+    for segment in parse_script_segments(theme, total_seconds):
+        chunks = split_voiceover(segment.voiceover)
+        cue_duration = segment.duration / max(1, len(chunks))
+        for chunk in chunks:
+            cues.append(
+                CaptionCue(
+                    shot=segment.shot,
+                    label=segment.label,
+                    text=chunk,
+                    duration=cue_duration,
+                )
+            )
+    return cues
+
+
+def wave_duration(path: Path) -> float:
+    with wave.open(str(path), "rb") as handle:
+        return handle.getnframes() / float(handle.getframerate())
+
+
+def concat_wavs(wav_paths: list[Path], output_path: Path, pause_seconds: float) -> Path:
+    if not wav_paths:
+        raise ValueError("No wav files to concatenate.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(wav_paths[0]), "rb") as first:
+        params = first.getparams()
+
+    silence_frames = int(params.framerate * pause_seconds)
+    silence = b"\x00" * silence_frames * params.nchannels * params.sampwidth
+
+    with wave.open(str(output_path), "wb") as output:
+        output.setparams(params)
+        for index, wav_path in enumerate(wav_paths):
+            with wave.open(str(wav_path), "rb") as source:
+                if source.getparams()[:3] != params[:3]:
+                    raise ValueError(f"WAV format mismatch: {wav_path}")
+                output.writeframes(source.readframes(source.getnframes()))
+            if pause_seconds > 0 and index < len(wav_paths) - 1:
+                output.writeframes(silence)
+
+    return output_path
+
+
+def synthesize_aligned_voice(
+    cues: list[CaptionCue],
+    temp_root: Path,
+    temp_stem: str,
+    voice_keyword: str,
+    rate: int,
+    pause_seconds: float,
+) -> tuple[list[CaptionCue], Path]:
+    wav_paths: list[Path] = []
+    aligned: list[CaptionCue] = []
+
+    for index, cue in enumerate(cues, start=1):
+        wav_path = temp_root / f"{temp_stem}.{index:03d}.wav"
+        synthesize_sapi_wav(cue.text, wav_path, voice_keyword=voice_keyword, rate=rate)
+        duration = wave_duration(wav_path)
+        wav_paths.append(wav_path)
+        aligned.append(
+            CaptionCue(
+                shot=cue.shot,
+                label=cue.label,
+                text=cue.text,
+                duration=max(0.25, duration + pause_seconds),
+            )
+        )
+
+    audio_path = temp_root / f"{temp_stem}.aligned.wav"
+    concat_wavs(wav_paths, audio_path, pause_seconds=pause_seconds)
+    return aligned, audio_path
 
 
 def make_canvas(width: int, height: int) -> Image.Image:
@@ -291,7 +376,7 @@ def draw_scene_five(draw: ImageDraw.ImageDraw, width: int, height: int, progress
     draw.text((width * 0.17, height * 0.19), "把注意力拿回来", fill=(40, 40, 40), font=fonts.title)
 
 
-def draw_header(draw: ImageDraw.ImageDraw, width: int, title: str, segment: VideoSegment, fonts: Fonts) -> None:
+def draw_header(draw: ImageDraw.ImageDraw, width: int, title: str, segment: CaptionCue, fonts: Fonts) -> None:
     margin = int(width * 0.07)
     draw.text((margin, 36), f"镜头 {segment.shot} · {segment.label}", fill=(100, 86, 64), font=fonts.small)
     lines = wrap_text(title, fonts.title, width - margin * 2)
@@ -348,14 +433,14 @@ def render_frame(
     width: int,
     height: int,
     title: str,
-    segment: VideoSegment,
+    cue: CaptionCue,
     segment_progress: float,
     video_progress: float,
     fonts: Fonts,
 ) -> Image.Image:
     image = make_canvas(width, height).convert("RGBA")
     draw = ImageDraw.Draw(image)
-    draw_header(draw, width, title, segment, fonts)
+    draw_header(draw, width, title, cue, fonts)
 
     scene_drawers = {
         1: draw_scene_one,
@@ -364,11 +449,9 @@ def render_frame(
         4: draw_scene_four,
         5: draw_scene_five,
     }
-    scene_drawers.get(segment.shot, draw_scene_one)(draw, width, height, segment_progress, fonts)
+    scene_drawers.get(cue.shot, draw_scene_one)(draw, width, height, segment_progress, fonts)
 
-    chunks = split_voiceover(segment.voiceover)
-    chunk_index = min(len(chunks) - 1, int(segment_progress * len(chunks)))
-    draw_subtitle(image, chunks[chunk_index], fonts)
+    draw_subtitle(image, cue.text, fonts)
     draw_progress_bar(ImageDraw.Draw(image), width, height, video_progress)
     return image.convert("RGB")
 
@@ -387,19 +470,36 @@ def render_video(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fonts = build_fonts(width)
     title = generate_titles(theme)[0]
-    segments = parse_script_segments(theme, total_seconds)
+    cues = build_caption_cues(theme, total_seconds)
     temp_stem = hashlib.sha1(str(output_path).encode("utf-8")).hexdigest()[:12]
     temp_root = default_tts_temp_root()
     temp_root.mkdir(parents=True, exist_ok=True)
     render_path = temp_root / f"{temp_stem}.silent{output_path.suffix}" if with_voice else output_path
 
+    audio_path: Path | None = None
+    if with_voice:
+        cues, audio_path = synthesize_aligned_voice(
+            cues,
+            temp_root=temp_root,
+            temp_stem=temp_stem,
+            voice_keyword=voice_keyword,
+            rate=voice_rate,
+            pause_seconds=0.12,
+        )
+        total_seconds = sum(cue.duration for cue in cues)
+
     total_frames = max(1, int(total_seconds * fps))
-    timeline: list[tuple[float, float, VideoSegment]] = []
+    timeline: list[tuple[float, float, CaptionCue]] = []
     cursor = 0.0
-    for segment in segments:
+    shot_bounds: dict[int, list[float]] = {}
+    for cue in cues:
         start = cursor
-        end = cursor + segment.duration
-        timeline.append((start, end, segment))
+        end = cursor + cue.duration
+        timeline.append((start, end, cue))
+        if cue.shot not in shot_bounds:
+            shot_bounds[cue.shot] = [start, end]
+        else:
+            shot_bounds[cue.shot][1] = end
         cursor = end
 
     writer = imageio.get_writer(
@@ -415,15 +515,19 @@ def render_video(
         last_bucket = -1
         for frame_index in range(total_frames):
             current_time = frame_index / fps
-            start, end, segment = timeline[-1]
+            start, end, cue = timeline[-1]
             for item in timeline:
                 if item[0] <= current_time < item[1]:
-                    start, end, segment = item
+                    start, end, cue = item
                     break
 
-            segment_progress = min(1.0, max(0.0, (current_time - start) / max(0.01, end - start)))
+            shot_start, shot_end = shot_bounds[cue.shot]
+            segment_progress = min(
+                1.0,
+                max(0.0, (current_time - shot_start) / max(0.01, shot_end - shot_start)),
+            )
             video_progress = min(1.0, frame_index / max(1, total_frames - 1))
-            frame = render_frame(width, height, title, segment, segment_progress, video_progress, fonts)
+            frame = render_frame(width, height, title, cue, segment_progress, video_progress, fonts)
             writer.append_data(np.asarray(frame))
 
             bucket = int(video_progress * 10)
@@ -433,11 +537,8 @@ def render_video(
     finally:
         writer.close()
 
-    if with_voice:
-        wav_path = temp_root / f"{temp_stem}.voice.wav"
-        voice_text = "\n".join(segment.voiceover for segment in segments)
-        synthesize_sapi_wav(voice_text, wav_path, voice_keyword=voice_keyword, rate=voice_rate)
-        mux_audio(render_path, wav_path, output_path, total_seconds=total_seconds)
+    if with_voice and audio_path:
+        mux_audio(render_path, audio_path, output_path, total_seconds=total_seconds)
 
     return output_path
 
@@ -526,7 +627,10 @@ def mux_audio(video_path: Path, audio_path: Path, output_path: Path, total_secon
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a simple stickman vertical short video.")
-    parser.add_argument("theme", help="短视频主题")
+    parser.add_argument("theme", nargs="?", help="短视频主题")
+    parser.add_argument("--batch30", action="store_true", help="批量生成内置 30 个主题")
+    parser.add_argument("--topic-file", type=Path, help="从主题文件读取， 每行一个主题")
+    parser.add_argument("--limit", type=int, help="限制批量生成数量，适合测试")
     parser.add_argument("--seconds", type=float, default=60, help="视频时长，默认 60 秒")
     parser.add_argument("--fps", type=int, default=12, help="帧率，默认 12")
     parser.add_argument("--width", type=int, default=720, help="视频宽度，默认 720")
@@ -538,22 +642,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_themes(args: argparse.Namespace) -> list[str]:
+    if args.batch30:
+        themes = list(DEFAULT_TOPICS)
+    elif args.topic_file:
+        themes = read_topics_file(args.topic_file)
+    elif args.theme:
+        themes = [args.theme]
+    else:
+        raise SystemExit("Please provide a theme, --batch30, or --topic-file.")
+
+    if args.limit is not None:
+        if args.limit <= 0:
+            raise SystemExit("--limit must be greater than 0.")
+        themes = themes[: args.limit]
+
+    if not themes:
+        raise SystemExit("No themes to render.")
+    return themes
+
+
 def main() -> None:
     args = parse_args()
-    slug = sanitize_filename(args.theme)
-    output_path = args.out / f"{slug}.mp4"
-    rendered = render_video(
-        theme=args.theme,
-        output_path=output_path,
-        total_seconds=args.seconds,
-        fps=args.fps,
-        width=args.width,
-        height=args.height,
-        with_voice=args.voice,
-        voice_keyword=args.voice_keyword,
-        voice_rate=args.voice_rate,
-    )
-    print(f"video generated: {rendered}")
+    themes = resolve_themes(args)
+    batch_mode = len(themes) > 1
+
+    for index, theme in enumerate(themes, start=1):
+        slug = sanitize_filename(theme)
+        filename = f"{index:03d}_{slug}.mp4" if batch_mode else f"{slug}.mp4"
+        output_path = args.out / filename
+        print(f"[{index}/{len(themes)}] rendering: {theme}")
+        rendered = render_video(
+            theme=theme,
+            output_path=output_path,
+            total_seconds=args.seconds,
+            fps=args.fps,
+            width=args.width,
+            height=args.height,
+            with_voice=args.voice,
+            voice_keyword=args.voice_keyword,
+            voice_rate=args.voice_rate,
+        )
+        print(f"video generated: {rendered}")
 
 
 if __name__ == "__main__":
