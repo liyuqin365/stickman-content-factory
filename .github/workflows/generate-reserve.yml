@@ -1,0 +1,45 @@
+name: Generate Content Reserve
+
+on:
+  workflow_dispatch:
+    inputs:
+      total:
+        description: Content count
+        default: "1000"
+        required: true
+      days:
+        description: Schedule days
+        default: "90"
+        required: true
+      start_date:
+        description: Start date, YYYY-MM-DD
+        default: "2026-06-03"
+        required: true
+  schedule:
+    - cron: "0 1 * * 1"
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate reserve
+        run: |
+          python reserve_factory.py \
+            --total "${{ github.event.inputs.total || '1000' }}" \
+            --days "${{ github.event.inputs.days || '90' }}" \
+            --start-date "${{ github.event.inputs.start_date || '2026-06-03' }}" \
+            --out outputs/reserve_1000
+
+      - name: Upload reserve artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stickman-content-reserve
+          path: outputs/reserve_1000
